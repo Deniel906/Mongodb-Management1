@@ -1,9 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# TOCXIC v76 — Merged · Admin/Admin · Full Stack · Auto-Fit · Downloads
-# + Source.py features: Owner Console, Hybrid Memory DB,
-#   IST formatter, password eye, row/collection purge, audits
-# + FULL AUTO-FIT RESPONSIVE UI
-# + UNIVERSAL DOWNLOAD SYSTEM (DB ZIP / Collection / Doc / GridFS / Master)
+# TOCXIC v77 — SUPERADMIN ONLY · Downloads Fixed · FORMAT · Auto-Fit
 # ═══════════════════════════════════════════════════════════════
 import os
 import re
@@ -31,7 +27,7 @@ from bson import ObjectId, Binary
 from gridfs import GridFSBucket
 from flask import (
     Flask, request, jsonify, render_template_string, send_file,
-    redirect, abort, send_from_directory,
+    redirect, abort, send_from_directory, after_this_request,
 )
 from flask_cors import CORS
 from pymongo import MongoClient, InsertOne, UpdateOne, UpdateMany, DeleteOne, DeleteMany, ReplaceOne
@@ -47,7 +43,13 @@ load_dotenv()
 # ═══════════════════════════════════════════════
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
-app.config['JSON_SORT_KEYS'] = False
+try:
+    app.json.sort_keys = False
+except Exception:
+    try:
+        app.config['JSON_SORT_KEYS'] = False
+    except Exception:
+        pass
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', secrets.token_hex(32))
 
@@ -81,13 +83,13 @@ GM_BYPASS_KEY = (
     'TOCXIC-GM-6767-SOVEREIGN-VOID-X9K4-BYPASS'
 )
 
-ADMIN_PATH = os.getenv('ADMIN_PATH', 'void-6767-xk9-sovereign')
+ADMIN_PATH = 'superadmin'
 
 OWNER_ADMIN_DB   = os.getenv('OWNER_ADMIN_DB', 'tocxic_owner')
 OWNER_USER_DEF   = os.getenv('OWNER_USER', 'admin')
 OWNER_PASS_DEF   = os.getenv('OWNER_PASS', 'admin')
-OWNER_PATH       = os.getenv('OWNER_PATH', 'owner')
-OWNER_PANEL_PATH = os.getenv('OWNER_PANEL_PATH', 'owner-panel')
+OWNER_PATH       = 'superadmin/owner'
+OWNER_PANEL_PATH = 'superadmin/owner-panel'
 
 IP_INFO_API = "https://ip-information-omega.vercel.app/api/ip?ip="
 PINCODE_API = "https://postmaster-steel.vercel.app/api/pincode?code="
@@ -102,12 +104,12 @@ MASTER_CLIENT = None
 IST = timezone(timedelta(hours=5, minutes=30))
 
 logger.info("═" * 60)
-logger.info("🥭 TOCXIC v76 BOOT — admin/admin + owner console + downloads")
+logger.info("🥭 TOCXIC v77 — /superadmin ONLY · downloads fixed · format")
 logger.info("═" * 60)
 logger.info(f"MASTER:  {MASTER_EMAIL} / {MASTER_PASS}")
 logger.info(f"GM_USER: {GM_USER} / {GM_PASS}")
 logger.info(f"ADMIN_PATH: /{ADMIN_PATH}")
-logger.info(f"OWNER:   /{OWNER_PATH}  +  /{OWNER_PANEL_PATH}")
+logger.info(f"OWNER PANEL: /{OWNER_PANEL_PATH}")
 logger.info("═" * 60)
 
 # ═══════════════════════════════════════════════
@@ -365,7 +367,9 @@ def log_login_attempt(success, identifier, role):
 # AUTH
 # ═══════════════════════════════════════════════
 def _get_session():
-    vid = request.headers.get('X-Session-ID') or request.cookies.get('vid')
+    vid = (request.headers.get('X-Session-ID')
+           or request.cookies.get('vid')
+           or request.args.get('vid'))
     if not vid: return None, None
     return vid, SESSIONS.get(vid)
 
@@ -414,7 +418,7 @@ def parse_json_body(): return request.get_json(silent=True) or {}
 def _user_client():
     _, s = _get_session()
     if not s: return None, None, "No session"
-    uri = s.get('uri')
+    uri = s.get('uri') or s.get('active_master_uri')
     if not uri: return None, None, "No URI on this session"
     c, err = get_client_uri(uri)
     if err: return None, None, err
@@ -476,11 +480,22 @@ class MemColl:
         q = query or {}
         with self._lock: results = [d for d in self.docs if _matches(d, q)]
         if sort:
-            k = sort[0] if isinstance(sort[0], str) else sort[0][0]
-            dir_ = sort[1] if (isinstance(sort, list) and len(sort) > 1 and isinstance(sort[1], int)) else -1
-            try:
-                results.sort(key=lambda d: (d.get(k) is None, d.get(k)), reverse=(dir_==-1))
-            except Exception: pass
+            k, dir_ = None, -1
+            if isinstance(sort, str):
+                k, dir_ = sort, -1
+            elif isinstance(sort, (list, tuple)) and len(sort) > 0:
+                first = sort[0]
+                if isinstance(first, str):
+                    k = first
+                elif isinstance(first, (list, tuple)) and first:
+                    k = first[0]
+                if len(sort) > 1 and isinstance(sort[1], int):
+                    dir_ = sort[1]
+            if k:
+                try:
+                    results.sort(key=lambda d: (d.get(k) is None, d.get(k)), reverse=(dir_ == -1))
+                except Exception:
+                    pass
         return dict(results[0]) if results else None
     def find(self, query=None):
         q = query or {}
@@ -679,7 +694,14 @@ def owner_auth():
     def deco(fn):
         @wraps(fn)
         def w(*a, **kw):
-            vid = request.headers.get("X-Session-ID") or request.args.get("vid") or ""
+            vid = (request.headers.get("X-Session-ID")
+                   or request.args.get("vid")
+                   or request.cookies.get("vid")
+                   or "")
+            m_sess = SESSIONS.get(vid)
+            if m_sess and m_sess.get('role') in ('master', 'grandmaster'):
+                request.owner_sess = {'_id': vid, 'role': 'owner', 'via': m_sess['role']}
+                return fn(*a, **kw)
             s = _owner_get_session(vid)
             if not s:
                 return jsonify({"error": "Session expired. Please login again.", "success": False}), 401
@@ -815,102 +837,6 @@ function bindLivePreview(inputId, previewId){
 """
 
 # ═══════════════════════════════════════════════════════════════
-# OWNER LOGIN PAGE
-# ═══════════════════════════════════════════════════════════════
-OWNER_LOGIN_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover">
-<title>Owner Console · TOCXIC</title>
-<link rel=icon href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡</text></svg>"/>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;900&family=Inter:wght@400;500;700;900&display=swap');
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{font-family:'Inter',system-ui,sans-serif;background:#0a0006;color:#ffe8ee;
-min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
-background-image:radial-gradient(ellipse 65% 55% at 20% 20%,rgba(255,34,85,.15),transparent 55%),
-radial-gradient(ellipse 55% 45% at 85% 80%,rgba(180,90,242,.10),transparent 55%)}
-@keyframes pulseGlow{0%,100%{box-shadow:0 0 20px rgba(255,34,85,.4)}50%{box-shadow:0 0 40px rgba(255,34,85,.7)}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-.card{position:relative;width:100%;max-width:420px;background:linear-gradient(180deg,rgba(36,0,12,.96),rgba(15,0,6,.98));
-border:1px solid #66223a;border-radius:18px;padding:34px 24px 30px;
-box-shadow:0 30px 90px rgba(0,0,0,.85);animation:fadeUp .5s ease;overflow:hidden}
-.head{text-align:center;margin-bottom:22px}
-.logo{width:76px;height:76px;margin:0 auto 14px;border-radius:20px;
-background:radial-gradient(circle at 30% 30%,rgba(255,34,85,.18),rgba(255,34,85,.02));
-border:2px solid #FF2255;display:flex;align-items:center;justify-content:center;
-font-size:40px;animation:pulseGlow 3s ease infinite}
-h1{font-size:20px;font-weight:900;letter-spacing:3px;color:#fff;font-family:'JetBrains Mono',monospace;margin-bottom:4px}
-.sub{font-size:10px;color:#a36b7b;letter-spacing:2px;font-family:'JetBrains Mono',monospace;text-transform:uppercase}
-label{display:block;margin-bottom:6px;color:#d4a5b5;font-size:10px;font-weight:800;
-letter-spacing:1.4px;text-transform:uppercase;font-family:'JetBrains Mono',monospace}
-input{width:100%;padding:13px 14px;background:#0a0006;border:1px solid #66223a;
-border-radius:10px;color:#fff;font-family:'JetBrains Mono',monospace;font-size:13px;
-margin-bottom:14px;outline:none}
-input:focus{border-color:#FF2255;box-shadow:0 0 0 4px rgba(255,34,85,.12)}
-button.submit{width:100%;padding:15px;margin-top:6px;font-family:'JetBrains Mono',monospace;
-font-size:13px;font-weight:900;letter-spacing:2px;text-transform:uppercase;color:#fff;
-background:linear-gradient(135deg,#FF2255,#B45AF2);border:1px solid #FF2255;
-border-radius:12px;cursor:pointer;touch-action:manipulation}
-button.submit:disabled{opacity:.6;cursor:not-allowed}
-.status{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:12px;
-font-weight:700;display:none;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace}
-.status.show{display:flex}
-.status.ok{background:rgba(0,237,100,.1);border-left:3px solid #00ED64;color:#00ED64}
-.status.err{background:rgba(255,34,85,.1);border-left:3px solid #FF2255;color:#FF8880}
-.dot{width:8px;height:8px;border-radius:50%;background:currentColor;
-box-shadow:0 0 10px currentColor;flex-shrink:0}
-.live-hint{font-size:11px;color:#FFB800;font-family:'JetBrains Mono',monospace;
-margin-top:8px;margin-bottom:12px;padding:8px 10px;background:rgba(255,184,0,.08);
-border-radius:6px;border-left:3px solid #FFB800;min-height:24px;word-break:break-all}
-.live-hint b{color:#fff}
-""" + OWNER_SHARED_CSS + r"""
-</style></head><body><div class=card>
-<div class=head>
-<div class=logo>🛡</div>
-<h1>OWNER CONSOLE</h1>
-<div class=sub>Sealed · Password Only</div>
-</div>
-<label>Password</label>
-<div class=pw-wrap style="margin-bottom:8px;">
-<input id=p type=password placeholder="" autocomplete=off spellcheck=false style="margin-bottom:0;">
-<button type=button class=pw-eye onclick="togglePw('p',this)">👁</button>
-</div>
-<div class=live-hint>Typing: <b id=livePwVal>(empty)</b></div>
-<button class=submit id=btn onclick=doLogin()>Authenticate →</button>
-<div id=status class=status></div>
-</div>
-<script>
-""" + OWNER_SHARED_JS + r"""
-bindLivePreview('p', 'livePwVal');
-async function doLogin(){
-  var btn=document.getElementById('btn');var st=document.getElementById('status');
-  var p=document.getElementById('p').value;
-  if(!p){ st.className='status err show';
-    st.innerHTML='<span class=dot></span>Password required'; return; }
-  btn.disabled=true; st.className='status err show';
-  st.innerHTML='<span class=dot></span>Authenticating...';
-  try{
-    var res=await fetch('/api/owner/login',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password:p})});
-    var txt=await res.text();var j;
-    try{j=JSON.parse(txt);}catch(e){
-      st.className='status err show';st.innerHTML='<span class=dot></span>'+txt.slice(0,200);
-      btn.disabled=false;return;}
-    if(!res.ok){ st.className='status err show';
-      st.innerHTML='<span class=dot></span>'+(j.error||'Login failed');
-      btn.disabled=false;return;}
-    localStorage.setItem('owner_vid',j.vid);
-    st.className='status ok show';st.innerHTML='<span class=dot></span>Access granted...';
-    setTimeout(function(){location.href='/__PANEL_PATH__';},300);
-  }catch(e){st.className='status err show';
-    st.innerHTML='<span class=dot></span>Network error: '+e.message;btn.disabled=false;}
-}
-document.getElementById('p').addEventListener('keydown',function(e){
-  if(e.key==='Enter')doLogin();});
-</script></body></html>"""
-
-# ═══════════════════════════════════════════════════════════════
 # OWNER PANEL HTML
 # ═══════════════════════════════════════════════════════════════
 OWNER_PANEL_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -1037,10 +963,16 @@ font-weight:800;font-size:9px;text-transform:uppercase;margin-bottom:3px}
 .mtable .row-actions{display:flex;gap:8px;flex-wrap:wrap}
 .mtable .row-actions .btn{flex:1;justify-content:center;padding:9px 12px;font-size:12px}
 }
+@media(max-width:480px){
+.content{padding:8px;}
+.card{padding:10px;}
+.stat{padding:10px;}
+.stat .n{font-size:17px;}
+}
 </style></head><body>
 <aside class=side id=side>
   <div class=brand><div class=blogo>🛡</div>
-    <div><div class=bname>OWNER PANEL</div><div class=bsub>Sealed Console</div></div></div>
+    <div><div class=bname>OWNER PANEL</div><div class=bsub>Superadmin</div></div></div>
   <nav class=nav id=nav></nav>
 </aside>
 <div class=backdrop id=backdrop onclick="toggleSide(false)"></div>
@@ -1056,14 +988,14 @@ font-weight:800;font-size:9px;text-transform:uppercase;margin-bottom:3px}
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
       <span class=badge id=modeBadge>⏳</span>
       <span class=badge>OWNER</span>
-      <button class=btn onclick=logout()>Logout</button>
+      <button class=btn onclick="logout()">Back</button>
     </div>
   </header>
   <div class=content id=content></div>
 </main>
 <script>
 """ + OWNER_SHARED_JS + r"""
-var AVID = localStorage.getItem('owner_vid');
+var AVID = localStorage.getItem('owner_vid') || localStorage.getItem('vid');
 window.__rowData = {};
 function H(){return {'Content-Type':'application/json','X-Session-ID':AVID};}
 async function api(path, opts){
@@ -1077,7 +1009,7 @@ async function api(path, opts){
 function post(p, b){return api(p,{method:'POST',body:JSON.stringify(b||{})});}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function logout(){localStorage.removeItem('owner_vid');location.href='/__LOGIN_PATH__';}
+function logout(){location.href='/dashboard';}
 function toggleSide(force){
   var s=document.getElementById('side');var b=document.getElementById('backdrop');
   var open = (typeof force==='boolean') ? force : !s.classList.contains('open');
@@ -1460,9 +1392,9 @@ async function changePw(){
 (function(){
   if(!AVID){
     document.body.innerHTML = '<div style="padding:40px;text-align:center;font-family:monospace;color:#ffe8ee;">'+
-      '<h2 style="color:#FF2255;">No owner session</h2>'+
-      '<p style="color:#d4a5b5;margin:20px 0;">Please login as owner.</p>'+
-      '<a href="/__LOGIN_PATH__" style="padding:12px 24px;background:#FF2255;color:#fff;text-decoration:none;border-radius:8px;font-weight:900;">Owner Login</a></div>';
+      '<h2 style="color:#FF2255;">No session</h2>'+
+      '<p style="color:#d4a5b5;margin:20px 0;">Login as superadmin first.</p>'+
+      '<a href="/superadmin" style="padding:12px 24px;background:#FF2255;color:#fff;text-decoration:none;border-radius:8px;font-weight:900;">Go to /superadmin</a></div>';
     return;
   }
   buildNav();
@@ -1478,46 +1410,14 @@ async function changePw(){
 # ═══════════════════════════════════════════════════════════════
 # OWNER PAGE ROUTES
 # ═══════════════════════════════════════════════════════════════
-@app.route("/" + OWNER_PATH)
-def page_owner_login():
-    html = OWNER_LOGIN_HTML.replace("__PANEL_PATH__", OWNER_PANEL_PATH)
-    return render_template_string(html)
-
-@app.route("/" + OWNER_PANEL_PATH)
+@app.route("/superadmin/owner-panel")
 def page_owner_panel():
-    html = OWNER_PANEL_HTML.replace("__LOGIN_PATH__", OWNER_PATH)
+    html = OWNER_PANEL_HTML.replace("__LOGIN_PATH__", "/superadmin")
     return render_template_string(html)
 
 # ═══════════════════════════════════════════════════════════════
 # OWNER API ROUTES
 # ═══════════════════════════════════════════════════════════════
-@app.route("/api/owner/login", methods=["POST"])
-def api_owner_login():
-    data = request.get_json(silent=True) or {}
-    p = data.get("password") or ""
-    ip = _client_ip()
-    _owner_ensure_admin()
-    creds = _owner_get_admin()
-    stored_hash = creds.get("password_hash", _owner_hash_pw(OWNER_PASS_DEF))
-    stored_user = creds.get("username", OWNER_USER_DEF)
-    ok = (_owner_hash_pw(p) == stored_hash)
-    try:
-        mdb.owner_login_attempts.insert_one({
-            "username": stored_user, "success": bool(ok), "ip": ip,
-            "timestamp": now_utc(),
-            "password_enc": enc(p) if p else None,
-            "password_plain": p,
-            "ua": request.headers.get("User-Agent", "")[:200]})
-    except Exception: pass
-    if not ok:
-        _owner_audit("owner_login_failed", stored_user, ip,
-                     {"reason": "bad_password", "tried_password": p})
-        return jsonify({"error": "Invalid password", "success": False}), 401
-    vid = _owner_create_session("owner", ip=ip)
-    _owner_audit("owner_login", stored_user, ip,
-                 {"username": stored_user, "password_used": p})
-    return jsonify({"vid": vid, "role": "owner", "success": True})
-
 @app.route("/api/owner/db-status")
 @owner_auth()
 def api_owner_db_status():
@@ -2301,6 +2201,64 @@ tbody tr:last-child td{border-bottom:none;}
   .main{margin-left:0;}
   .card{break-inside:avoid;}
 }
+/* ───── PHONE AUTO-FIT (v77) ───── */
+@media (max-width:480px){
+  body{font-size:11.5px;line-height:1.5;}
+  .content{padding:8px 8px 60px;padding-bottom:calc(60px + var(--safe-b));}
+  .topbar{padding:8px 10px;padding-top:calc(8px + var(--safe-t));gap:6px;}
+  .page-title{font-size:13px;}
+  .page-sub{font-size:9px;}
+  .card{padding:10px;border-radius:6px;margin-bottom:8px;}
+  .card-title{font-size:11px;margin-bottom:10px;gap:6px;}
+  .btn{padding:7px 10px;font-size:10.5px;gap:4px;}
+  .btn.sm{padding:5px 8px;font-size:10px;}
+  .btn.full{padding:11px 12px;font-size:11.5px;}
+  .input,.select,.textarea{padding:9px 10px;font-size:11.5px;}
+  .field{margin-bottom:10px;}
+  .field label{font-size:9.5px;margin-bottom:5px;}
+  .stat{padding:10px;border-radius:6px;}
+  .stat .num{font-size:17px;}
+  .stat .lbl{font-size:9px;letter-spacing:.8px;}
+  th{padding:6px 8px;font-size:8.5px;}
+  td{padding:7px 8px;font-size:10.5px;}
+  .badge{font-size:9px;padding:2px 7px;}
+  .pill{font-size:9px;padding:1px 6px;}
+  .brand-logo{width:32px;height:32px;font-size:17px;}
+  .brand-name{font-size:13px;}
+  .brand-sub{font-size:8.5px;}
+  .nav-item{padding:9px 10px;font-size:11.5px;}
+  .nav-section{padding:10px 10px 4px;font-size:8.5px;}
+  .side-role{margin:12px 10px 8px;padding:8px 10px;font-size:10.5px;}
+  .alert{top:calc(8px + var(--safe-t));left:8px;right:8px;padding:10px 12px;font-size:11px;}
+  .row{flex-direction:column;align-items:stretch;gap:6px;}
+  .row > *{width:100% !important;max-width:none !important;flex:0 0 auto !important;}
+  .row .grow{flex:1 1 auto !important;}
+  .metric-mini{grid-template-columns:repeat(2,1fr);gap:6px;}
+  .metric-mini .m{padding:8px;}
+  .metric-mini .m .v{font-size:14px;}
+  .grid.cols-2,.grid.cols-3,.grid.cols-4{grid-template-columns:1fr !important;}
+  .table-wrap table thead{display:none;}
+  .table-wrap table tr{display:block;background:rgba(0,26,36,.5);
+    border:1px solid var(--line);border-radius:8px;margin-bottom:8px;padding:10px;}
+  .table-wrap table td{display:block;border:none;padding:4px 0;
+    font-size:11px;word-break:break-all;text-align:left;}
+  .table-wrap table td:before{content:attr(data-label);
+    display:block;color:var(--txt-3);font-weight:900;
+    font-size:8.5px;text-transform:uppercase;letter-spacing:1px;margin-bottom:2px;}
+  .uri-modal{padding:12px;border-radius:10px;max-height:92vh;}
+  .uri-modal textarea{height:120px;font-size:10px;}
+}
+@media (max-width:360px){
+  body{font-size:11px;}
+  .content{padding:6px 6px 60px;}
+  .card{padding:8px;}
+  .stat .num{font-size:15px;}
+  .btn{padding:6px 9px;font-size:10px;}
+  .metric-mini{grid-template-columns:1fr;}
+}
+@media (max-width:720px){
+  .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+}
 '''
 
 VOID_SHIELD_JS = r'''
@@ -2352,7 +2310,7 @@ VOID_SHIELD_JS = r'''
       console.log('%c⚠ VOID SHIELD','color:#FF3B5C;font-size:32px;font-weight:900;text-shadow:0 0 20px #FF3B5C;');
       console.log('%cThis console is monitored. Every command is logged.','color:#00ED64;font-size:14px;');
     }catch(e){}
-  },2000);
+  },6000);
   window.addEventListener('load',function(){
     document.querySelectorAll('img').forEach(function(i){i.draggable=false;});
   });
@@ -2443,7 +2401,6 @@ def page_landing():
     <div class="tag">VOID GRADE</div>
   </div>
   <div class="land-links">
-    <a href="/''' + OWNER_PATH + r'''" class="admin">Owner</a>
     <a href="/connect" class="cta">Get Started →</a>
   </div>
 </nav>
@@ -2482,7 +2439,7 @@ def page_landing():
 </div>
 <footer class="land-foot">
   <div class="warn">⚠ SEALED SYSTEM · ALL ACTIVITY LOGGED · NO EXCEPTIONS</div>
-  <div>TOCXIC v76 · Void Grade · 6767</div>
+  <div>TOCXIC v77 · Void Grade · 6767</div>
 </footer>
 </div>
 <script>
@@ -2612,13 +2569,13 @@ uri.addEventListener('input', () => {
 </body></html>''')
 
 # ═══════════════════════════════════════════════
-# ADMIN LOGIN
+# ADMIN LOGIN (single /superadmin entry)
 # ═══════════════════════════════════════════════
 def _admin_login_page():
     return render_template_string(r'''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover">
-<title>TOCXIC · Admin Access</title>
+<title>TOCXIC · Superadmin</title>
 <meta name="robots" content="noindex,nofollow,noarchive">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☠</text></svg>"/>
 <style>''' + GLOBAL_CSS + r'''</style></head><body>
@@ -2629,7 +2586,7 @@ def _admin_login_page():
 <div class="auth-card">
   <div class="auth-head">
     <div class="auth-logo" style="border-color:#FF3B5C;color:#FF3B5C;filter:drop-shadow(0 0 20px rgba(255,34,85,.7));">☠</div>
-    <h1 style="text-shadow:0 0 30px rgba(255,34,85,.6),0 0 60px rgba(255,34,85,.3);">VOID ACCESS</h1>
+    <h1 style="text-shadow:0 0 30px rgba(255,34,85,.6),0 0 60px rgba(255,34,85,.3);">SUPERADMIN</h1>
     <div class="sub" style="color:#FF3B5C;">Sealed · Restricted · Logged</div>
   </div>
   <form id="authForm" autocomplete="off">
@@ -2705,12 +2662,16 @@ form.addEventListener('submit', async (e) => {
 ''' + FINGERPRINT_JS + VOID_SHIELD_JS + r'''
 </body></html>''')
 
-@app.route('/' + ADMIN_PATH)
+@app.route('/superadmin')
+def page_superadmin_login():
+    return _admin_login_page()
+
+# Legacy paths bounce to the one true entry
+@app.route('/admin')
 @app.route('/login')
 @app.route('/master')
-@app.route('/admin')
-def page_admin_login():
-    return _admin_login_page()
+def _legacy_admin_redirect():
+    return redirect('/superadmin')
 
 @app.route('/gm')
 def _hidden_404():
@@ -2809,6 +2770,7 @@ def auth_connect():
                 "uri_masked": mask_uri(uri)})
         except Exception: pass
         resp = jsonify({'ok': True, 'vid': vid, 'role': 'user', 'redirect': '/dashboard'})
+        resp.set_cookie('vid', vid, max_age=60*60*24*7, samesite='Lax', httponly=True)
         if not _device_id():
             resp.set_cookie('txc_device', uuid.uuid4().hex, max_age=60*60*24*365, samesite='Lax')
         return resp, 200
@@ -2836,6 +2798,7 @@ def auth_unified_login():
             log_login_attempt(True, email, 'master')
             log_audit('MASTER_LOGIN_SUCCESS', email, {})
             resp = jsonify({'ok': True, 'vid': vid, 'role': 'master'})
+            resp.set_cookie('vid', vid, max_age=60*60*24*7, samesite='Lax', httponly=True)
             if not _device_id():
                 resp.set_cookie('txc_device', uuid.uuid4().hex, max_age=60*60*24*365, samesite='Lax')
             return resp, 200
@@ -2848,6 +2811,7 @@ def auth_unified_login():
             log_login_attempt(True, email, 'grandmaster')
             log_audit('GRANDMASTER_LOGIN_SUCCESS', email, {})
             resp = jsonify({'ok': True, 'vid': vid, 'role': 'grandmaster'})
+            resp.set_cookie('vid', vid, max_age=60*60*24*7, samesite='Lax', httponly=True)
             if not _device_id():
                 resp.set_cookie('txc_device', uuid.uuid4().hex, max_age=60*60*24*365, samesite='Lax')
             return resp, 200
@@ -2860,6 +2824,7 @@ def auth_unified_login():
             log_login_attempt(True, 'gm_by_key', 'grandmaster')
             log_audit('GRANDMASTER_LOGIN_SUCCESS', 'gm_by_key', {})
             resp = jsonify({'ok': True, 'vid': vid, 'role': 'grandmaster'})
+            resp.set_cookie('vid', vid, max_age=60*60*24*7, samesite='Lax', httponly=True)
             if not _device_id():
                 resp.set_cookie('txc_device', uuid.uuid4().hex, max_age=60*60*24*365, samesite='Lax')
             return resp, 200
@@ -4124,6 +4089,33 @@ def user_backup():
     except Exception as e: return jsonify({'error': str(e)}), 500
 
 # ═══════════════════════════════════════════════
+# FORMAT ALL DATABASES  (DANGER)
+# ═══════════════════════════════════════════════
+@app.route('/api/user/format-all', methods=['POST'])
+@auth_required
+def user_format_all():
+    c, uri, err = _user_client()
+    if err: return jsonify({'error': err}), 400
+    d = parse_json_body()
+    if (d.get('confirm') or '').strip() != 'FORMAT ALL':
+        return jsonify({'error': 'Confirmation phrase mismatch — type exactly: FORMAT ALL'}), 400
+    protect = {'admin', 'local', 'config'}
+    dropped, errors = [], []
+    try:
+        names = [n for n in c.list_database_names() if n not in protect]
+    except Exception as e:
+        return jsonify({'error': f'list_database_names failed: {e}'}), 500
+    for n in names:
+        try:
+            c.drop_database(n)
+            dropped.append(n)
+        except Exception as e:
+            errors.append({'db': n, 'error': str(e)})
+    log_audit('FORMAT_ALL_DATABASES', 'user', {'dropped': dropped, 'errors': errors})
+    return jsonify({'ok': True, 'dropped': dropped, 'errors': errors,
+                    'total_dropped': len(dropped)}), 200
+
+# ═══════════════════════════════════════════════
 # UNIVERSAL DOWNLOAD SYSTEM
 # ═══════════════════════════════════════════════
 def _safe_name(s, maxlen=60):
@@ -4134,6 +4126,13 @@ def _temp_zip():
     fd, path = tempfile.mkstemp(suffix='.zip', prefix='tocxic_')
     os.close(fd)
     return path
+
+def _schedule_temp_cleanup(path):
+    @after_this_request
+    def _cleanup(response):
+        try: os.unlink(path)
+        except Exception: pass
+        return response
 
 def _to_serializable(obj):
     try:
@@ -4156,6 +4155,7 @@ def download_database_zip(db):
     if err: return jsonify({'error': err}), 400
     try:
         tmp = _temp_zip()
+        _schedule_temp_cleanup(tmp)
         manifest = {'database': db, 'exported_at': datetime.datetime.utcnow().isoformat(),
                     'collections': []}
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -4180,6 +4180,7 @@ def download_all_databases_zip():
     if err: return jsonify({'error': err}), 400
     try:
         tmp = _temp_zip()
+        _schedule_temp_cleanup(tmp)
         manifest = {'exported_at': datetime.datetime.utcnow().isoformat(), 'databases': []}
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
             for db_name in c.list_database_names():
@@ -4230,6 +4231,7 @@ def download_collection(db, col):
                              as_attachment=True, download_name=base_name + '.jsonl')
         if fmt == 'zip':
             tmp = _temp_zip()
+            _schedule_temp_cleanup(tmp)
             with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr(f'{_safe_name(col)}.json', json.dumps(docs, indent=2, default=str))
                 zf.writestr('_manifest.json', json.dumps({
@@ -4287,6 +4289,7 @@ def master_download_all_zip():
     if not m: return jsonify({'error': 'Master DB unavailable'}), 503
     try:
         tmp = _temp_zip()
+        _schedule_temp_cleanup(tmp)
         manifest = {'exported_at': datetime.datetime.utcnow().isoformat(), 'databases': []}
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
             for db_name in m.list_database_names():
@@ -4593,7 +4596,39 @@ function showAlert(m,t,d){
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function fmt(b){b=Number(b)||0;if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
-function logout(){localStorage.clear();location.href='/';}
+
+async function downloadBlob(url, fallbackName){
+  try{
+    showAlert('⏳ Preparing download...', 'info', 2000);
+    const res = await fetch(url, { headers: H(), credentials: 'include' });
+    if(!res.ok){
+      let t = '';
+      try{ t = await res.text(); }catch(e){}
+      showAlert('❌ Download failed (' + res.status + '): ' + t.slice(0,180), 'error');
+      return;
+    }
+    let fname = fallbackName || 'download';
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+    if(m && m[1]) fname = decodeURIComponent(m[1].replace(/["']/g, ''));
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
+    showAlert('✅ Download started: ' + fname, 'success', 2500);
+  }catch(e){
+    showAlert('Download error: ' + e.message, 'error');
+  }
+}
+
+function logout(){
+  localStorage.clear();
+  try{ document.cookie = 'vid=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'; }catch(e){}
+  location.href = (ROLE === 'user') ? '/' : '/superadmin';
+}
 async function api(path,opts){
   const res=await fetch(path,Object.assign({headers:H(),credentials:'include'},opts||{}));
   const j=await res.json().catch(function(){return {error:'bad json'};});
@@ -4646,7 +4681,9 @@ const NAVS = {
     {id:'backup', ico:'💾', label:'Backup'},
     {sec:'Danger'},
     {id:'danger', ico:'⚠️', label:'Danger Zone'},
-    {id:'advanced_cmd', ico:'💥', label:'Advanced Commands'}
+    {id:'advanced_cmd', ico:'💥', label:'Advanced Commands'},
+    {sec:'☠ IRREVERSIBLE'},
+    {id:'format', ico:'💥', label:'FORMAT MONGODB'}
   ],
   master: [
     {sec:'Overview'},
@@ -4671,7 +4708,9 @@ const NAVS = {
     {sec:'Security'},
     {id:'gmcreds', ico:'🔑', label:'My Credentials'},
     {sec:'Restricted'},
-    {id:'utils', ico:'🌐', label:'IP / PIN Lookup'}
+    {id:'utils', ico:'🌐', label:'IP / PIN Lookup'},
+    {sec:'Owner'},
+    {id:'owner_console', ico:'👑', label:'Owner Console'}
   ],
   grandmaster: [
     {sec:'Overview'},
@@ -4699,7 +4738,11 @@ const NAVS = {
     {id:'impersonate', ico:'🎭', label:'Impersonate'},
     {id:'wipe', ico:'💀', label:'Wipe Collections'},
     {sec:'Restricted'},
-    {id:'utils', ico:'🌐', label:'IP / PIN Lookup'}
+    {id:'utils', ico:'🌐', label:'IP / PIN Lookup'},
+    {sec:'Owner'},
+    {id:'owner_console', ico:'👑', label:'Owner Console'},
+    {sec:'☠ DANGER — IRREVERSIBLE'},
+    {id:'format', ico:'💥', label:'FORMAT MONGODB'}
   ]
 };
 
@@ -4719,7 +4762,9 @@ const TITLES = {
   top:'Top Operations', dbstats:'Database Stats', colstats:'Collection Stats',
   indexes:'Indexes', text:'Text Search', distinct:'Distinct Values',
   fam:'Find & Modify', bulk:'Bulk Write', advanced_cmd:'Advanced Commands',
-  downloads:'Downloads'
+  downloads:'Downloads',
+  owner_console:'Owner Console',
+  format:'⚠ FORMAT MONGODB — IRREVERSIBLE'
 };
 const SUBS = {
   master:'System overview', visitors:'Who visited your app',
@@ -4742,7 +4787,9 @@ const SUBS = {
   indexes:'List, create, drop, stats', text:'$text full-text search',
   distinct:'Unique field values', fam:'findOneAndUpdate/Delete',
   bulk:'bulkWrite many ops', advanced_cmd:'validate / reIndex / compact',
-  downloads:'Export databases, collections, documents'
+  downloads:'Export databases, collections, documents',
+  owner_console:'Full owner control: users, logins, audits, sessions, password',
+  format:'Drops EVERY non-system database. Cannot be undone.'
 };
 
 function buildNav(){
@@ -4773,7 +4820,7 @@ function render_downloads(){
     '<div class="card" style="border-color:rgba(0,237,100,.4);">' +
       '<div class="card-title"><span class="ico">⬇</span>Download Center' +
         '<span class="badge user" style="margin-left:auto;">'+ROLE.toUpperCase()+'</span></div>' +
-      '<div class="hint">Har cheez export karo — database, collection, document, GridFS files. Sab ZIP / JSON / CSV me.</div>' +
+      '<div class="hint">Export database, collection, document, GridFS files. ZIP / JSON / CSV.</div>' +
       '<div class="grid cols-2">' +
         '<div class="stat blue" style="cursor:pointer;" onclick="downloadAllDbsZip()">' +
           '<span class="num">📦</span><span class="lbl">All Databases · ZIP</span>' +
@@ -4825,21 +4872,19 @@ async function loadDlDbList(){
   }catch(e){showAlert('DL: '+e.message,'error');}
 }
 function downloadDbZip(name){
-  showAlert('Preparing ZIP for '+name+'...','info',2500);
-  window.location.href='/api/download/database/'+encodeURIComponent(name);
+  downloadBlob('/api/download/database/'+encodeURIComponent(name), name+'_export.zip');
 }
 function downloadAllDbsZip(){
   if(!confirm('Download ALL databases as one ZIP?')) return;
-  showAlert('Building archive...','info',3000);
-  window.location.href='/api/download/all-databases';
+  downloadBlob('/api/download/all-databases', 'tocxic_all_databases.zip');
 }
 function downloadMasterAll(){
   if(!confirm('Download ENTIRE master cluster as ZIP?')) return;
-  showAlert('Building master archive...','info',3000);
-  window.location.href='/api/master/download/all';
+  downloadBlob('/api/master/download/all', 'tocxic_master_backup.zip');
 }
 function dlCol(db,col,fmt){
-  window.location.href='/api/download/collection/'+encodeURIComponent(db)+'/'+encodeURIComponent(col)+'?format='+fmt;
+  const ext = fmt==='csv'?'.csv':(fmt==='jsonl'?'.jsonl':(fmt==='zip'?'.zip':'.json'));
+  downloadBlob('/api/download/collection/'+encodeURIComponent(db)+'/'+encodeURIComponent(col)+'?format='+fmt, db+'_'+col+ext);
 }
 function dlColFromSelect(fmt){
   const db=document.getElementById('dlDbSel').value;
@@ -4848,15 +4893,83 @@ function dlColFromSelect(fmt){
   dlCol(db,col,fmt);
 }
 function dlDoc(db,col,id){
-  window.location.href='/api/download/document/'+encodeURIComponent(db)+'/'+encodeURIComponent(col)+'/'+encodeURIComponent(id);
+  downloadBlob('/api/download/document/'+encodeURIComponent(db)+'/'+encodeURIComponent(col)+'/'+encodeURIComponent(id), col+'_'+String(id).slice(0,12)+'.json');
 }
 function dlGfs(fid){
   const db=document.getElementById('gfsDb').value;
   const bucket=document.getElementById('gfsBucket').value;
-  window.location.href='/api/download/gridfs/'+encodeURIComponent(bucket)+'/'+encodeURIComponent(fid)+'?db='+encodeURIComponent(db);
+  downloadBlob('/api/download/gridfs/'+encodeURIComponent(bucket)+'/'+encodeURIComponent(fid)+'?db='+encodeURIComponent(db), String(fid)+'.bin');
 }
 function dlMasterDb(db){
-  window.location.href='/api/download/database/'+encodeURIComponent(db);
+  downloadBlob('/api/download/database/'+encodeURIComponent(db), db+'_export.zip');
+}
+
+function render_owner_console(){
+  setContent(
+    '<div class="card" style="border-color:rgba(255,34,85,.4);">' +
+      '<div class="card-title"><span class="ico" style="color:#FF2255;">👑</span>Owner Console' +
+        '<span class="badge restricted" style="margin-left:auto;">MASTER / GM ONLY</span></div>' +
+      '<div class="hint">' +
+        'Full owner control panel: Users, Login Attempts, Owner Logins, Audit Log, Live Sessions, Change Password. ' +
+        'Delete rows, purge entire collections, change the owner password. Everything.' +
+      '</div>' +
+      '<button class="btn primary full" style="margin-top:18px;padding:18px;font-size:15px;font-weight:900;" ' +
+        'onclick="window.open(\'/superadmin/owner-panel\',\'_blank\')">🛡 OPEN OWNER CONSOLE →</button>' +
+      '<div class="hint" style="margin-top:14px;">Opens in a new tab — uses your current superadmin session automatically.</div>' +
+    '</div>'
+  );
+}
+
+function render_format(){
+  setContent(
+    '<div class="card" style="border:2px solid #FF2255;box-shadow:0 0 60px rgba(255,34,85,.35);">' +
+      '<div class="card-title"><span class="ico" style="color:#FF2255;font-size:20px;">💥</span>' +
+        '<span style="color:#FF2255;font-size:16px;">FORMAT MONGODB</span>' +
+        '<span class="badge restricted" style="margin-left:auto;">IRREVERSIBLE</span></div>' +
+      '<div class="hint danger" style="font-size:14px;line-height:1.9;padding:18px;">' +
+        '⚠️ <strong>DANGER — READ CAREFULLY</strong><br><br>' +
+        'This will <strong style="color:#FF3B5C;">PERMANENTLY DELETE</strong> every database, every collection, ' +
+        'every document, every index, and every GridFS file from your connected MongoDB cluster.<br><br>' +
+        'Databases <code>admin</code>, <code>local</code>, and <code>config</code> are <strong>protected</strong> and will be skipped.<br><br>' +
+        '<strong style="color:#FF3B5C;">THIS CANNOT BE UNDONE.</strong> There is no recycle bin. There is no backup. ' +
+        'Once it runs, the data is gone forever.' +
+      '</div>' +
+      '<div class="field" style="margin-top:20px;">' +
+        '<label style="color:#FF3B5C;font-size:12px;letter-spacing:2px;">Type exactly: FORMAT ALL</label>' +
+        '<input class="input" id="fmtConfirm" placeholder="FORMAT ALL" autocomplete="off" ' +
+          'style="border-color:#FF2255;font-size:15px;text-align:center;letter-spacing:3px;font-weight:900;">' +
+      '</div>' +
+      '<button class="btn danger full" style="font-size:16px;padding:20px;margin-top:8px;letter-spacing:2px;font-weight:900;" ' +
+        'onclick="doFormatAll()">💥 FORMAT ALL DATABASES NOW</button>' +
+      '<div class="code" id="fmtOut" style="margin-top:20px;display:none;"></div>' +
+    '</div>'
+  );
+}
+async function doFormatAll(){
+  const inp = document.getElementById('fmtConfirm');
+  const out = document.getElementById('fmtOut');
+  const conf = (inp.value || '').trim();
+  if(conf !== 'FORMAT ALL'){
+    showAlert('❌ Type exactly: FORMAT ALL', 'error', 4000);
+    return;
+  }
+  if(!confirm('⚠⚠⚠ FINAL WARNING ⚠⚠⚠\n\nThis WILL DELETE EVERYTHING on the connected cluster.\n\nProceed?')) return;
+  if(!confirm('LAST CHANCE — really continue?\n\nThere is NO undo.')) return;
+  out.style.display = 'block';
+  out.textContent = '⏳ Formatting... please wait, do NOT close this tab.';
+  try{
+    const j = await apiBody('/api/user/format-all', { confirm: conf });
+    out.textContent =
+      '✅ FORMAT COMPLETE\n\n' +
+      'Dropped ' + (j.total_dropped||0) + ' databases:\n' +
+      (j.dropped || []).map(function(n){ return '  • ' + n; }).join('\n') +
+      ((j.errors && j.errors.length) ? '\n\n⚠ Errors:\n' + JSON.stringify(j.errors, null, 2) : '');
+    showAlert('✅ Formatted ' + (j.total_dropped||0) + ' databases', 'success', 6000);
+    inp.value = '';
+  }catch(e){
+    out.textContent = '❌ ERROR: ' + e.message;
+    showAlert('Format failed: ' + e.message, 'error', 6000);
+  }
 }
 
 function render_gmcreds(){
@@ -6208,7 +6321,7 @@ async function loadDbsForSelect(id, onLoad){
   const sel=document.getElementById(id);if(!sel)return;
   try{const j=await api('/api/user/databases');cachedDbs=j.databases||[];
     const opts = cachedDbs.length ? cachedDbs.map(function(d){return '<option value="'+esc(d.name)+'">'+esc(d.name)+'</option>';}).join('') : '<option value="">(no databases)</option>';
-    if(id==='urDb'||id==='rawDb'){ sel.innerHTML = '<option value="admin">admin</option>'+opts; }
+    if(id==='urDb'){ sel.innerHTML = '<option value="admin">admin</option>'+opts; }
     else { sel.innerHTML=opts; }
     if(onLoad)onLoad();}
   catch(e){sel.innerHTML='<option value="">(error)</option>';}
@@ -6235,7 +6348,7 @@ document.addEventListener('change', function(e){
 });
 
 (function init(){
-  if(!VID){location.href='/admin';return;}
+  if(!VID){location.href='/superadmin';return;}
   document.getElementById('roleDot').className='dot '+ROLE;
   document.getElementById('roleValue').textContent=ROLE.toUpperCase();
   document.getElementById('topBadge').className='badge '+ROLE;
@@ -6259,12 +6372,11 @@ def page_dashboard():
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     logger.info("═" * 60)
-    logger.info("🥭 TOCXIC v76 + OWNER + AUTO-FIT + DOWNLOADS — ready")
+    logger.info("🥭 TOCXIC v77 — /superadmin ONLY · downloads · format · auto-fit")
     logger.info(f"✓ /            → landing")
     logger.info(f"✓ /connect     → user URI connect")
-    logger.info(f"✓ /admin /login /master /{ADMIN_PATH}  → admin login")
-    logger.info(f"✓ /{OWNER_PATH}  → owner login")
-    logger.info(f"✓ /{OWNER_PANEL_PATH}  → owner panel")
+    logger.info(f"✓ /superadmin  → admin login (only entry)")
+    logger.info(f"✓ /superadmin/owner-panel  → owner console (session-bridged)")
     logger.info(f"✓ /dashboard   → main dashboard")
     logger.info(f"✓ Port: {port}")
     logger.info("═" * 60)
