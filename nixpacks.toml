@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python311", "mongodb-tools"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 300 app:app"
