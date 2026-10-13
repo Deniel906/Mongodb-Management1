@@ -1,8 +1,7 @@
-Flask==3.0.3
-flask-cors==4.0.1
-pymongo==4.8.0
-dnspython==2.6.1
-python-dotenv==1.0.1
-gridfs==0.0.0
-cryptography==43.0.1
-gunicorn==22.0.0
+Flask
+flask-cors
+pymongo[srv]
+dnspython
+python-dotenv
+cryptography
+gunicorn
