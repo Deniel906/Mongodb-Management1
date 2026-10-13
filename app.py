@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# TOCXIC v77 — SUPERADMIN ONLY · Downloads Fixed · FORMAT · Auto-Fit
+# TOCXIC v78 — SUPERADMIN · DB SESSIONS · NO TIMEOUT · FULLY WORKING
 # ═══════════════════════════════════════════════════════════════
 import os
 import re
@@ -98,13 +98,12 @@ CONNECT_TIMEOUT_MS  = 8000
 SERVER_SELECTION_MS = 8000
 SOCKET_TIMEOUT_MS   = 30000
 
-SESSIONS = {}
 MASTER_CLIENT = None
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 logger.info("═" * 60)
-logger.info("🥭 TOCXIC v77 — /superadmin ONLY · downloads fixed · format")
+logger.info("🥭 TOCXIC v78 — /superadmin · DB sessions · no timeout")
 logger.info("═" * 60)
 logger.info(f"MASTER:  {MASTER_EMAIL} / {MASTER_PASS}")
 logger.info(f"GM_USER: {GM_USER} / {GM_PASS}")
@@ -246,6 +245,127 @@ def _coll_visitor_sess():
     d = _db_visitors(); return d['sessions'] if d is not None else None
 def _coll_devices():
     d = _db_fingerprints(); return d['devices'] if d is not None else None
+
+# ═══════════════════════════════════════════════
+# ENCRYPTION + TIME HELPERS (must be before DBSessions)
+# ═══════════════════════════════════════════════
+try:
+    from cryptography.fernet import Fernet
+    _k = base64.urlsafe_b64encode(hashlib.sha256(app.config['SECRET_KEY'].encode()).digest())
+    _f = Fernet(_k)
+    def enc(s): return _f.encrypt(s.encode()).decode()
+    def dec(s): return _f.decrypt(s.encode()).decode()
+except Exception:
+    def enc(s): return base64.b64encode(s.encode()).decode()
+    def dec(s): return base64.b64decode(s.encode()).decode()
+
+def now_utc(): return _dt.now(timezone.utc)
+
+def iso_utc(dt):
+    if dt is None: return None
+    if isinstance(dt, str): return dt
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    else: dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+def safe_dec(v):
+    try: return dec(v) if v else ""
+    except Exception: return "(decrypt error)"
+
+# ═══════════════════════════════════════════════════════════════
+# DB-BACKED SESSIONS (survives multi-worker + redeploy)
+# ═══════════════════════════════════════════════════════════════
+class DBSessions:
+    """Cross-worker session store — backed by MongoDB, cached in memory."""
+    def __init__(self, cache_ttl=5):
+        self._cache = {}
+        self._cache_ttl = cache_ttl
+        self._lock = Lock()
+
+    def _coll(self):
+        try:
+            c = get_master_client()
+            if c is None: return None
+            return c[DB_GMASTER]['app_sessions']
+        except Exception:
+            return None
+
+    def get(self, vid, default=None):
+        if not vid: return default
+        now = time.time()
+        with self._lock:
+            if vid in self._cache:
+                val, ts = self._cache[vid]
+                if now - ts < self._cache_ttl:
+                    return dict(val)
+        try:
+            coll = self._coll()
+            if coll is not None:
+                doc = coll.find_one({"_id": vid})
+                if doc:
+                    doc.pop("_id", None)
+                    doc.pop("_updated", None)
+                    doc.pop("_created", None)
+                    with self._lock:
+                        self._cache[vid] = (dict(doc), now)
+                    return dict(doc)
+        except Exception as e:
+            logger.error(f"session get: {e}")
+        with self._lock:
+            if vid in self._cache:
+                return dict(self._cache[vid][0])
+        return default
+
+    def __getitem__(self, vid):
+        v = self.get(vid)
+        if v is None: raise KeyError(vid)
+        return v
+
+    def __setitem__(self, vid, value):
+        if not vid or value is None: return
+        d = dict(value)
+        d["_id"] = vid
+        d["_updated"] = now_utc()
+        with self._lock:
+            self._cache[vid] = (dict(d), time.time())
+        try:
+            coll = self._coll()
+            if coll is not None:
+                upd = dict(d)
+                upd.pop("_id", None)
+                coll.update_one(
+                    {"_id": vid},
+                    {"$set": upd, "$setOnInsert": {"_created": now_utc()}},
+                    upsert=True
+                )
+        except Exception as e:
+            logger.error(f"session set: {e}")
+
+    def __contains__(self, vid):
+        return self.get(vid) is not None
+
+    def __delitem__(self, vid):
+        try:
+            coll = self._coll()
+            if coll is not None: coll.delete_one({"_id": vid})
+        except Exception: pass
+        with self._lock:
+            self._cache.pop(vid, None)
+
+    def pop(self, vid, default=None):
+        v = self.get(vid)
+        if v is not None: self.__delitem__(vid)
+        return v if v is not None else default
+
+    def __len__(self):
+        try:
+            coll = self._coll()
+            if coll is not None: return coll.count_documents({})
+        except Exception: pass
+        with self._lock:
+            return len(self._cache)
+
+SESSIONS = DBSessions()
 
 # ═══════════════════════════════════════════════
 # DYNAMIC CREDENTIALS
@@ -626,32 +746,6 @@ class HybridDB:
         return self._colls[name]
 
 mdb = HybridDB()
-
-# ═══════════════════════════════════════════════════════════════
-# ENCRYPTION + TIME HELPERS
-# ═══════════════════════════════════════════════════════════════
-try:
-    from cryptography.fernet import Fernet
-    _k = base64.urlsafe_b64encode(hashlib.sha256(app.config['SECRET_KEY'].encode()).digest())
-    _f = Fernet(_k)
-    def enc(s): return _f.encrypt(s.encode()).decode()
-    def dec(s): return _f.decrypt(s.encode()).decode()
-except Exception:
-    def enc(s): return base64.b64encode(s.encode()).decode()
-    def dec(s): return base64.b64decode(s.encode()).decode()
-
-def now_utc(): return _dt.now(timezone.utc)
-
-def iso_utc(dt):
-    if dt is None: return None
-    if isinstance(dt, str): return dt
-    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-    else: dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
-
-def safe_dec(v):
-    try: return dec(v) if v else ""
-    except Exception: return "(decrypt error)"
 
 # ═══════════════════════════════════════════════════════════════
 # OWNER SESSIONS + AUTH
@@ -1091,7 +1185,7 @@ function renderFromHash(){
   var fn = window['view_'+id];
   if(typeof fn === 'function') fn();
 }
-function setC(h){document.getElementById('content').innerHTML = h;}
+function setC(h){var e=document.getElementById('content');if(e)e.innerHTML=h;}
 async function refreshModeBadge(){
   try{
     var j = await api('/api/owner/db-status');
@@ -1118,6 +1212,7 @@ function view_overview(){
     '<div class=card><div class=ct><span class=i>📋</span>Recent Activity</div><div id=ovRecent></div></div>');
   refreshModeBadge();
   api('/api/owner/stats').then(function(j){
+    setC;
     document.getElementById('ovStats').innerHTML =
       '<div class="stat"><div class=n>'+(j.total_users||0)+'</div><div class=l>Total Users</div></div>'+
       '<div class="stat g"><div class=n>'+(j.active_sessions||0)+'</div><div class=l>Active Sessions</div></div>'+
@@ -1130,9 +1225,10 @@ function view_overview(){
         '<strong style="color:#FF2255;">'+esc(a.action)+'</strong> '+
         '<span style="color:#a36b7b;">· '+esc(a.user||'')+' · '+fmtTime(a.timestamp)+'</span></div>';
     }).join('') || '<div class=empty><div class=m>No recent activity</div></div>';
-    document.getElementById('ovRecent').innerHTML = rec;
+    var el=document.getElementById('ovRecent'); if(el) el.innerHTML = rec;
   }).catch(function(e){
-    document.getElementById('ovStats').innerHTML =
+    var el=document.getElementById('ovStats'); if(!el) return;
+    el.innerHTML =
       '<div class=empty style="grid-column:1/-1;"><span class=i>⚠</span><div class=m>'+esc(e.message)+
       '<br><br><button class="btn p" onclick="view_overview()">Retry</button></div></div>';
   });
@@ -2201,7 +2297,7 @@ tbody tr:last-child td{border-bottom:none;}
   .main{margin-left:0;}
   .card{break-inside:avoid;}
 }
-/* ───── PHONE AUTO-FIT (v77) ───── */
+/* ───── PHONE AUTO-FIT (v78) ───── */
 @media (max-width:480px){
   body{font-size:11.5px;line-height:1.5;}
   .content{padding:8px 8px 60px;padding-bottom:calc(60px + var(--safe-b));}
@@ -2439,7 +2535,7 @@ def page_landing():
 </div>
 <footer class="land-foot">
   <div class="warn">⚠ SEALED SYSTEM · ALL ACTIVITY LOGGED · NO EXCEPTIONS</div>
-  <div>TOCXIC v77 · Void Grade · 6767</div>
+  <div>TOCXIC v78 · Void Grade · 6767</div>
 </footer>
 </div>
 <script>
@@ -2569,7 +2665,7 @@ uri.addEventListener('input', () => {
 </body></html>''')
 
 # ═══════════════════════════════════════════════
-# ADMIN LOGIN (single /superadmin entry)
+# ADMIN LOGIN
 # ═══════════════════════════════════════════════
 def _admin_login_page():
     return render_template_string(r'''<!DOCTYPE html>
@@ -2666,7 +2762,6 @@ form.addEventListener('submit', async (e) => {
 def page_superadmin_login():
     return _admin_login_page()
 
-# Legacy paths bounce to the one true entry
 @app.route('/admin')
 @app.route('/login')
 @app.route('/master')
@@ -3038,7 +3133,10 @@ def master_uris_activate(uri_id):
     doc = coll.find_one({'_id': ObjectId(uri_id)})
     if not doc: return jsonify({'error': 'URI not found'}), 404
     vid, s = _get_session()
-    s['active_master_uri'] = doc['uri']
+    if s is not None and vid:
+        s = dict(s)
+        s['active_master_uri'] = doc['uri']
+        SESSIONS[vid] = s
     coll.update_one({'_id': doc['_id']}, {'$set': {'last_used': datetime.datetime.utcnow()}})
     log_audit('MASTER_URI_ACTIVATE', 'master', {'label': doc.get('label')})
     return jsonify({'ok': True, 'label': doc.get('label'), 'masked': mask_uri(doc['uri'])}), 200
@@ -4089,7 +4187,7 @@ def user_backup():
     except Exception as e: return jsonify({'error': str(e)}), 500
 
 # ═══════════════════════════════════════════════
-# FORMAT ALL DATABASES  (DANGER)
+# FORMAT ALL DATABASES
 # ═══════════════════════════════════════════════
 @app.route('/api/user/format-all', methods=['POST'])
 @auth_required
@@ -4483,7 +4581,9 @@ def gm_delete_user(vid):
     uris = _coll_uris()
     if uris is None: return jsonify({'error': 'Master DB unavailable'}), 503
     res = uris.delete_many({'vid': vid})
-    if vid in SESSIONS: del SESSIONS[vid]
+    try:
+        if vid in SESSIONS: del SESSIONS[vid]
+    except Exception: pass
     log_audit('GM_DELETE_USER', 'grandmaster', {'vid': vid})
     return jsonify({'ok': True, 'deleted': res.deleted_count}), 200
 
@@ -4596,6 +4696,9 @@ function showAlert(m,t,d){
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function fmt(b){b=Number(b)||0;if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
+function setContent(html){var e=document.getElementById('content');if(e)e.innerHTML=html;}
+function setEl(id, html){var e=document.getElementById(id);if(e)e.innerHTML=html;}
+function setTxt(id, txt){var e=document.getElementById(id);if(e)e.textContent=txt;}
 
 async function downloadBlob(url, fallbackName){
   try{
@@ -4640,7 +4743,6 @@ async function apiBody(path,body,method){
   return api(path,{method:method,body:JSON.stringify(body||{})});
 }
 function empty(ico,msg){return '<div class="empty"><span class="ico">'+ico+'</span><div class="msg">'+esc(msg)+'</div></div>';}
-function setContent(html){document.getElementById('content').innerHTML=html;}
 function ipBtn(ip){return '<button class="btn checkip" onclick="lookupIp(\''+esc(ip)+'\')">🔍 CHECK IP</button>';}
 
 const NAVS = {
@@ -4859,6 +4961,7 @@ async function loadDlDbList(){
   try{
     const j = await api('/api/user/databases');cachedDbs=j.databases||[];
     const el=document.getElementById('dlDbList');
+    if(!el) return;
     if(!cachedDbs.length){el.innerHTML=empty('🗄','No databases');return;}
     el.innerHTML = '<div class="table-wrap"><table><thead><tr>' +
       '<th>Database</th><th>Collections</th><th>Documents</th><th>Size</th><th>Export</th>' +
@@ -5005,10 +5108,10 @@ function render_gmcreds(){
 async function loadCreds(){
   try{
     const j = await api('/api/gm/credentials');
-    document.getElementById('credCurrent').textContent =
+    setTxt('credCurrent',
       '═══ GM ═══\nUsername:    ' + (j.username || '—') + '\nBypass Key:  ' + (j.bypass_key_masked || '—') +
-      '\n\n═══ MASTER ═══\n(Login email/password)';
-  }catch(e){document.getElementById('credCurrent').textContent = '⚠ ' + e.message;}
+      '\n\n═══ MASTER ═══\n(Login email/password)');
+  }catch(e){setTxt('credCurrent', '⚠ ' + e.message);}
 }
 async function saveCreds(){
   const cur=document.getElementById('credCurrentVal').value;
@@ -5047,57 +5150,63 @@ function render_mystorage(){
   loadMyStorage();
 }
 async function loadMyStorage(){
+  const hasDom = function(){ return document.getElementById('msStats') !== null; };
   if(ROLE !== 'user'){
     try{
       const me = await api('/api/me');
+      if(!hasDom()) return;
       const vault = await api('/api/master/uris');
       cachedMasterUris = vault.uris || [];
+      if(!hasDom()) return;
       if(!cachedMasterUris.length){
-        document.getElementById('msUri').innerHTML = '⚠ No active cluster. Add one in URI Vault.';
-        document.getElementById('msStats').innerHTML = empty('🔗','No active cluster');
-        document.getElementById('msRows').innerHTML = '<tr><td colspan="7">'+empty('🔗','No data')+'</td></tr>';
+        setEl('msUri', '⚠ No active cluster. Add one in URI Vault.');
+        setEl('msStats', empty('🔗','No active cluster'));
+        setEl('msRows', '<tr><td colspan="7">'+empty('🔗','No data')+'</td></tr>');
         return;
       }
       let active = cachedMasterUris.find(function(u){return me.active_master_uri && u.masked_uri === me.active_master_uri;});
       if(!active){ await apiBody('/api/master/uris/'+cachedMasterUris[0]._id+'/activate',{}); active = cachedMasterUris[0]; }
+      if(!hasDom()) return;
       window._activeUriId = active._id;
       const st = await api('/api/master/uris/'+active._id+'/storage');
-      document.getElementById('msUri').innerHTML = '🟢 Active: <strong style="color:#00ED64;">'+esc(st.label||'')+'</strong> · <span class="mono muted">'+esc(st.masked_uri||'')+'</span>';
+      if(!hasDom()) return;
+      setEl('msUri', '🟢 Active: <strong style="color:#00ED64;">'+esc(st.label||'')+'</strong> · <span class="mono muted">'+esc(st.masked_uri||'')+'</span>');
       const t = st.total || {};
-      document.getElementById('msStats').innerHTML =
+      setEl('msStats',
         '<div class="stat"><span class="num">'+fmt(t.storage||0)+'</span><span class="lbl">Storage</span></div>' +
         '<div class="stat blue"><span class="num">'+fmt(t.size||0)+'</span><span class="lbl">Data</span></div>' +
         '<div class="stat amber"><span class="num">'+(t.collections||0)+'</span><span class="lbl">Collections</span></div>' +
-        '<div class="stat purple"><span class="num">'+(t.documents||0).toLocaleString()+'</span><span class="lbl">Documents</span></div>';
-      document.getElementById('msRows').innerHTML = (st.databases||[]).map(function(d){
+        '<div class="stat purple"><span class="num">'+(t.documents||0).toLocaleString()+'</span><span class="lbl">Documents</span></div>');
+      setEl('msRows', (st.databases||[]).map(function(d){
         const n=esc(d.name);
         return '<tr><td><strong>'+n+'</strong></td>' +
           '<td>'+(d.collections||0)+'</td><td>'+(d.documents||0).toLocaleString()+'</td>' +
           '<td>'+(d.indexes||0)+'</td><td>'+fmt(d.size||0)+'</td>' +
           '<td>'+fmt(d.storage||0)+'</td>' +
           '<td><button class="btn green sm" onclick="dlMasterDb(\''+n+'\')">⬇ ZIP</button></td></tr>';
-      }).join('') || '<tr><td colspan="7">'+empty('💾','No databases')+'</td></tr>';
-    }catch(e){showAlert('Storage: '+e.message,'error');}
+      }).join('') || '<tr><td colspan="7">'+empty('💾','No databases')+'</td></tr>');
+    }catch(e){ if(hasDom()) showAlert('Storage: '+e.message,'error'); }
     return;
   }
   try{
     const j = await api('/api/user/storage');
-    document.getElementById('msUri').innerHTML = '🟢 Connected: <span class="mono muted">'+esc(j.masked_uri||'')+'</span>';
+    if(!hasDom()) return;
+    setEl('msUri', '🟢 Connected: <span class="mono muted">'+esc(j.masked_uri||'')+'</span>');
     const t = j.total || {};
-    document.getElementById('msStats').innerHTML =
+    setEl('msStats',
       '<div class="stat"><span class="num">'+fmt(t.storage||0)+'</span><span class="lbl">Storage</span></div>' +
       '<div class="stat blue"><span class="num">'+fmt(t.size||0)+'</span><span class="lbl">Data</span></div>' +
       '<div class="stat amber"><span class="num">'+(t.collections||0)+'</span><span class="lbl">Collections</span></div>' +
-      '<div class="stat purple"><span class="num">'+(t.documents||0).toLocaleString()+'</span><span class="lbl">Documents</span></div>';
-    document.getElementById('msRows').innerHTML = (j.databases||[]).map(function(d){
+      '<div class="stat purple"><span class="num">'+(t.documents||0).toLocaleString()+'</span><span class="lbl">Documents</span></div>');
+    setEl('msRows', (j.databases||[]).map(function(d){
       const n=esc(d.name);
       return '<tr><td><strong>'+n+'</strong></td>' +
         '<td>'+(d.collections||0)+'</td><td>'+(d.documents||0).toLocaleString()+'</td>' +
         '<td>'+(d.indexes||0)+'</td><td>'+fmt(d.size||0)+'</td>' +
         '<td>'+fmt(d.storage||0)+'</td>' +
         '<td><button class="btn green sm" onclick="downloadDbZip(\''+n+'\')">⬇ ZIP</button></td></tr>';
-    }).join('') || '<tr><td colspan="7">'+empty('💾','No databases')+'</td></tr>';
-  }catch(e){showAlert('Storage: '+e.message,'error');}
+    }).join('') || '<tr><td colspan="7">'+empty('💾','No databases')+'</td></tr>');
+  }catch(e){ if(hasDom()) showAlert('Storage: '+e.message,'error'); }
 }
 
 function render_myclusters(){
@@ -5116,6 +5225,7 @@ async function loadVault(){
     cachedMasterUris = j.uris || [];
     const me = await api('/api/me');
     const el = document.getElementById('vaultList');
+    if(!el) return;
     if(!cachedMasterUris.length){el.innerHTML=empty('🔗','No clusters yet');return;}
     el.innerHTML = '<div class="table-wrap"><table><thead><tr>' +
       '<th>Label</th><th>URI</th><th>DBs</th><th>Status</th><th>Actions</th>' +
@@ -5304,7 +5414,7 @@ async function loadDocs(){
   catch(e){showAlert('Find: '+e.message,'error');}
 }
 function renderDocList(db,col,docs){
-  const el=document.getElementById('docList');
+  const el=document.getElementById('docList'); if(!el) return;
   if(!docs.length){el.innerHTML='<div class="card">'+empty('📝','No docs')+'</div>';return;}
   el.innerHTML = docs.map(function(d){
     const id=d._id||'';
@@ -5361,8 +5471,8 @@ async function runAgg(){
   const db=document.getElementById('aggDb').value;const col=document.getElementById('aggCol').value;
   const p=document.getElementById('aggPipeline').value;if(!db||!col||!p)return;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/aggregate',{pipeline:p});
-    document.getElementById('aggOut').textContent = JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('aggOut').textContent='Error: '+e.message;}
+    setTxt('aggOut', JSON.stringify(j,null,2));}
+  catch(e){setTxt('aggOut','Error: '+e.message);}
 }
 
 function render_gridfs(){
@@ -5377,17 +5487,17 @@ function render_gridfs(){
 async function listBuckets(){
   const db=document.getElementById('gfsDb').value;
   try{const j=await api('/api/user/gridfs/buckets?db='+encodeURIComponent(db));
-    document.getElementById('gfsContent').innerHTML = '<div class="card"><div class="card-title">Buckets in '+esc(db)+'</div>' +
+    setEl('gfsContent','<div class="card"><div class="card-title">Buckets in '+esc(db)+'</div>' +
       '<div class="table-wrap"><table><thead><tr><th>Bucket</th><th>Files</th><th></th></tr></thead><tbody>' +
       (j.buckets.map(function(b){return '<tr><td>'+esc(b.name)+'</td><td>'+b.files+'</td>' +
         '<td><button class="btn ghost sm" onclick="document.getElementById(\'gfsBucket\').value=\''+esc(b.name)+'\';listFiles()">View</button></td></tr>';}).join('')
-        || '<tr><td colspan="3">'+empty('📦','No buckets')+'</td></tr>') + '</tbody></table></div></div>';}
+        || '<tr><td colspan="3">'+empty('📦','No buckets')+'</td></tr>') + '</tbody></table></div></div>');}
   catch(e){showAlert('Buckets: '+e.message,'error');}
 }
 async function listFiles(){
   const db=document.getElementById('gfsDb').value;const bucket=document.getElementById('gfsBucket').value;
   try{const j=await api('/api/user/gridfs/'+encodeURIComponent(bucket)+'/files?db='+encodeURIComponent(db));
-    document.getElementById('gfsContent').innerHTML = '<div class="card">' +
+    setEl('gfsContent','<div class="card">' +
       '<div class="card-title">Upload to '+esc(bucket)+'</div>' +
       '<div class="row"><input class="input grow" id="gfsFilename" placeholder="filename.txt">' +
       '<button class="btn primary" onclick="uploadGfs()">⬆ Upload text</button></div></div>' +
@@ -5402,7 +5512,7 @@ async function listFiles(){
           '<button class="btn green sm" onclick="dlGfs(\''+fid+'\')">⬇ Download</button>' +
           '<button class="btn danger sm" onclick="deleteGfs(\''+fid+'\')">🗑</button>' +
         '</div></td></tr>';}).join('') ||
-        '<tr><td colspan="5">'+empty('📦','No files')+'</td></tr>') + '</tbody></table></div></div>';}
+        '<tr><td colspan="5">'+empty('📦','No files')+'</td></tr>') + '</tbody></table></div></div>');}
   catch(e){showAlert('Files: '+e.message,'error');}
 }
 async function uploadGfs(){
@@ -5466,7 +5576,7 @@ function render_users_roles(){
 }
 async function loadUsersList(){const db=document.getElementById('urDb').value;
   try{const j=await api('/api/user/users?db='+encodeURIComponent(db));
-    document.getElementById('urContent').innerHTML = '<div class="card"><div class="card-title">Users in '+esc(db)+'</div>' +
+    setEl('urContent','<div class="card"><div class="card-title">Users in '+esc(db)+'</div>' +
       '<div class="table-wrap"><table><thead><tr><th>User</th><th>Roles</th><th>Actions</th></tr></thead><tbody>' +
       ((j.users||[]).map(function(u){
         return '<tr><td>'+esc(u.user)+'</td>' +
@@ -5476,17 +5586,17 @@ async function loadUsersList(){const db=document.getElementById('urDb').value;
         '<button class="btn ghost sm" onclick="revokeRole(\''+esc(u.user)+'\')">➖</button>' +
         '<button class="btn danger sm" onclick="dropUser(\''+esc(u.user)+'\')">🗑</button>' +
         '</div></td></tr>';}).join('')
-        || '<tr><td colspan="3">'+empty('👥','No users')+'</td></tr>') + '</tbody></table></div></div>';}
+        || '<tr><td colspan="3">'+empty('👥','No users')+'</td></tr>') + '</tbody></table></div></div>');}
   catch(e){showAlert(e.message,'error');}}
 async function loadRolesList(){const db=document.getElementById('urDb').value;
   try{const j=await api('/api/user/roles?db='+encodeURIComponent(db));
-    document.getElementById('urContent').innerHTML = '<div class="card"><div class="card-title">Roles in '+esc(db)+'</div>' +
+    setEl('urContent','<div class="card"><div class="card-title">Roles in '+esc(db)+'</div>' +
       '<div class="table-wrap"><table><thead><tr><th>Role</th><th>Privileges</th><th>Inherits</th><th></th></tr></thead><tbody>' +
       ((j.roles||[]).map(function(r){
         return '<tr><td>'+esc(r.role)+'</td><td>'+((r.privileges||[]).length)+'</td>' +
         '<td>'+((r.roles||[]).length)+'</td>' +
         '<td>'+(r.isBuiltin?'<span class="pill green">builtin</span>':'<button class="btn danger sm" onclick="dropRole(\''+esc(r.role)+'\')">🗑</button>')+'</td></tr>';}).join('')
-        || '<tr><td colspan="4">'+empty('🎭','No roles')+'</td></tr>') + '</tbody></table></div></div>';}
+        || '<tr><td colspan="4">'+empty('🎭','No roles')+'</td></tr>') + '</tbody></table></div></div>');}
   catch(e){showAlert(e.message,'error');}}
 function showCreateUser(){const db=document.getElementById('urDb').value;
   const name=prompt('Username:');if(!name)return;
@@ -5535,11 +5645,11 @@ function render_sessions(){
 }
 async function loadSessions(){
   try{const j=await api('/api/user/sessions');
-    document.getElementById('sessRows').innerHTML=((j.sessions||[]).map(function(s){
+    setEl('sessRows',((j.sessions||[]).map(function(s){
       return '<tr><td>'+esc(s.user||'')+'</td>' +
       '<td class="mono">'+esc((s._id||'').slice(-12))+'</td>' +
       '<td class="muted">'+esc((s.lastUse||'').slice(0,19))+'</td></tr>';}).join('')
-      || '<tr><td colspan="3">'+empty('👻','No sessions')+'</td></tr>');}
+      || '<tr><td colspan="3">'+empty('👻','No sessions')+'</td></tr>'));}
   catch(e){showAlert(e.message,'error');}
 }
 async function killAllSessions(){if(!confirm('Kill ALL?'))return;
@@ -5568,14 +5678,14 @@ function render_monitor(){
 }
 async function loadMonitor(){
   try{const j = await api('/api/user/monitor');
-    document.getElementById('monitorStats').innerHTML =
+    setEl('monitorStats',
       '<div class="stat"><span class="num">'+((j.connections||{}).current||0)+'</span><span class="lbl">Conns</span></div>' +
       '<div class="stat blue"><span class="num">'+((j.mem||{}).resident||0)+'</span><span class="lbl">Mem MB</span></div>' +
       '<div class="stat amber"><span class="num">'+(j.uptime||0)+'</span><span class="lbl">Uptime s</span></div>' +
       '<div class="stat purple"><span class="num">'+fmt((j.network||{}).bytesIn||0)+'</span><span class="lbl">In</span></div>' +
       '<div class="stat purple"><span class="num">'+fmt((j.network||{}).bytesOut||0)+'</span><span class="lbl">Out</span></div>' +
-      '<div class="stat blue"><span class="num">'+((j.opcounters||{}).query||0)+'</span><span class="lbl">Queries</span></div>';
-    document.getElementById('monitorRaw').textContent = JSON.stringify(j,null,2);
+      '<div class="stat blue"><span class="num">'+((j.opcounters||{}).query||0)+'</span><span class="lbl">Queries</span></div>');
+    setTxt('monitorRaw', JSON.stringify(j,null,2));
     const h = window._monHistory;
     if(h){const oc = j.opcounters||{};
       const totalOps = (oc.query||0)+(oc.insert||0)+(oc.update||0)+(oc.delete||0)+(oc.command||0);
@@ -5612,15 +5722,15 @@ function render_metrics(){
 }
 async function loadMetrics(){
   try{const j=await api('/api/user/server/metrics');const oc=j.opcounters||{};
-    document.getElementById('metricsGrid').innerHTML='<div class="metric-mini">' +
+    setEl('metricsGrid','<div class="metric-mini">' +
       '<div class="m"><div class="v">'+(oc.query||0)+'</div><div class="k">Queries</div></div>' +
       '<div class="m"><div class="v">'+(oc.insert||0)+'</div><div class="k">Inserts</div></div>' +
       '<div class="m"><div class="v">'+(oc.update||0)+'</div><div class="k">Updates</div></div>' +
       '<div class="m"><div class="v">'+(oc.delete||0)+'</div><div class="k">Deletes</div></div>' +
       '<div class="m"><div class="v">'+(oc.command||0)+'</div><div class="k">Commands</div></div>' +
       '<div class="m"><div class="v">'+(((j.opcountersRepl||{}).query)||0)+'</div><div class="k">Repl Q</div></div>' +
-      '</div>';
-    document.getElementById('metricsRaw').textContent=JSON.stringify(j,null,2);}
+      '</div>');
+    setTxt('metricsRaw',JSON.stringify(j,null,2));}
   catch(e){showAlert(e.message,'error');}
 }
 
@@ -5637,11 +5747,11 @@ function render_profiler(){
 }
 async function loadOps(){
   try{const j=await api('/api/user/profiler/current');
-    document.getElementById('opsRows').innerHTML=((j.ops||[]).map(function(o){
+    setEl('opsRows',((j.ops||[]).map(function(o){
       return '<tr><td class="mono">'+(o.opid||'')+'</td><td>'+esc(o.op||'')+'</td>' +
       '<td class="mono">'+esc(o.ns||'')+'</td><td>'+(o.secs_running||0)+'</td>' +
       '<td><button class="btn danger sm" onclick="killOp('+(o.opid||0)+')">Kill</button></td></tr>';}).join('')
-      || '<tr><td colspan="5">'+empty('✨','No active')+'</td></tr>');}
+      || '<tr><td colspan="5">'+empty('✨','No active')+'</td></tr>'));}
   catch(e){showAlert(e.message,'error');}
 }
 async function killOp(opid){if(!confirm('Kill op '+opid+'?'))return;
@@ -5650,7 +5760,7 @@ async function killOp(opid){if(!confirm('Kill op '+opid+'?'))return;
 async function setProfileLevel(){try{await apiBody('/api/user/profiler/level',{level:parseInt(document.getElementById('profileLevel').value)});
   showAlert('Level set','success');}catch(e){showAlert(e.message,'error');}}
 async function loadSlow(){try{const j=await api('/api/user/profiler/slow');
-  document.getElementById('slowBox').textContent=JSON.stringify(j.slow||[],null,2);}
+  setTxt('slowBox',JSON.stringify(j.slow||[],null,2));}
   catch(e){showAlert(e.message,'error');}}
 
 function render_explain(){
@@ -5671,8 +5781,8 @@ async function runExplain(){
   const filter=document.getElementById('expFilter').value||'{}';
   const verbosity=document.getElementById('expVerb').value;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/explain',{filter:filter,verbosity:verbosity});
-    document.getElementById('expOut').textContent=JSON.stringify(j.explain,null,2);}
-  catch(e){document.getElementById('expOut').textContent='Error: '+e.message;}
+    setTxt('expOut',JSON.stringify(j.explain,null,2));}
+  catch(e){setTxt('expOut','Error: '+e.message);}
 }
 
 function render_changes(){
@@ -5689,11 +5799,11 @@ function render_changes(){
 async function watchChanges(){
   const scope=document.getElementById('chScope').value;const db=document.getElementById('chDb').value;
   const col=document.getElementById('chCol').value;const dur=parseInt(document.getElementById('chDur').value)||10;
-  const out=document.getElementById('chOut');out.textContent='Watching '+dur+'s...';
+  const out=document.getElementById('chOut'); if(out) out.textContent='Watching '+dur+'s...';
   try{const url=scope==='database'?'/api/user/db/'+encodeURIComponent(db)+'/changes'
       :'/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/changes';
-    const j=await apiBody(url,{duration:dur});out.textContent=JSON.stringify(j.events,null,2);}
-  catch(e){out.textContent='Error: '+e.message;}
+    const j=await apiBody(url,{duration:dur});setTxt('chOut',JSON.stringify(j.events,null,2));}
+  catch(e){setTxt('chOut','Error: '+e.message);}
 }
 
 function render_repl(){
@@ -5704,10 +5814,10 @@ function render_repl(){
 }
 async function loadRepl(){
   try{const rs=await api('/api/user/repl/status');
-    if(!rs.replicaSet){document.getElementById('replOut').innerHTML='<div class="hint warn">Not a replica set: '+esc(rs.message||'')+'</div>';return;}
+    if(!rs.replicaSet){setEl('replOut','<div class="hint warn">Not a replica set: '+esc(rs.message||'')+'</div>');return;}
     const members=(rs.status.members||[]).map(function(m){return '<div class="m"><div class="v">'+esc(m.stateStr||'')+'</div><div class="k">'+esc(m.name||'')+'</div></div>';}).join('');
-    document.getElementById('replOut').innerHTML='<div class="metric-mini">'+members+'</div>' +
-      '<div class="code" style="margin-top:12px;max-height:400px;">'+esc(JSON.stringify(rs.status,null,2).slice(0,5000))+'</div>';}
+    setEl('replOut','<div class="metric-mini">'+members+'</div>' +
+      '<div class="code" style="margin-top:12px;max-height:400px;">'+esc(JSON.stringify(rs.status,null,2).slice(0,5000))+'</div>');}
   catch(e){showAlert(e.message,'error');}
 }
 
@@ -5725,7 +5835,7 @@ function render_server(){
 async function loadServer(which, el){
   if(el){document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');}
   try{const j=await api('/api/user/server/'+which);
-    document.getElementById('serverOut').textContent=JSON.stringify(j.info,null,2);}
+    setTxt('serverOut',JSON.stringify(j.info,null,2));}
   catch(e){showAlert(e.message,'error');}
 }
 
@@ -5736,7 +5846,7 @@ function render_top(){
   loadTop();
 }
 async function loadTop(){try{const j=await api('/api/user/server/top');
-  document.getElementById('topOut').textContent=JSON.stringify(j.info,null,2);}
+  setTxt('topOut',JSON.stringify(j.info,null,2));}
   catch(e){showAlert(e.message,'error');}}
 
 function render_logs(){
@@ -5747,10 +5857,10 @@ function render_logs(){
     '<div class="code" id="logsOut" style="max-height:500px;"></div></div>');
 }
 async function loadLogs(){try{const j=await api('/api/user/logs');
-  document.getElementById('logsOut').textContent=(j.log||[]).join('\n');}
+  setTxt('logsOut',(j.log||[]).join('\n'));}
   catch(e){showAlert(e.message,'error');}}
 async function loadCluster(){try{const j=await api('/api/user/cluster');
-  document.getElementById('logsOut').textContent=JSON.stringify(j,null,2);}
+  setTxt('logsOut',JSON.stringify(j,null,2));}
   catch(e){showAlert(e.message,'error');}}
 async function rotateLogs(){if(!confirm('Rotate logs?'))return;
   try{await apiBody('/api/user/logrotate',{});showAlert('Rotated','success');}
@@ -5765,7 +5875,7 @@ function render_dbstats(){
 }
 async function loadDs(){const db=document.getElementById('dsDb').value;
   try{const j=await api('/api/user/db/'+encodeURIComponent(db)+'/stats');
-    document.getElementById('dsOut').textContent=JSON.stringify(j.stats,null,2);}
+    setTxt('dsOut',JSON.stringify(j.stats,null,2));}
   catch(e){showAlert(e.message,'error');}}
 function render_colstats(){
   setContent('<div class="card"><div class="card-title"><span class="ico">📈</span>Collection Stats</div>' +
@@ -5777,7 +5887,7 @@ function render_colstats(){
 }
 async function loadCs(){const db=document.getElementById('csDb').value;const col=document.getElementById('csCol').value;
   try{const j=await api('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/stats');
-    document.getElementById('csOut').textContent=JSON.stringify(j.stats,null,2);}
+    setTxt('csOut',JSON.stringify(j.stats,null,2));}
   catch(e){showAlert(e.message,'error');}}
 
 function render_indexes(){
@@ -5792,23 +5902,23 @@ function render_indexes(){
 }
 async function loadIndexes(){const db=document.getElementById('ixDb').value;const col=document.getElementById('ixCol').value;
   try{const j=await api('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/indexes');
-    document.getElementById('ixContent').innerHTML='<div class="table-wrap" style="margin-top:12px;">' +
+    setEl('ixContent','<div class="table-wrap" style="margin-top:12px;">' +
       '<table><thead><tr><th>Name</th><th>Key</th><th>Unique</th><th>TTL</th><th></th></tr></thead><tbody>' +
       (j.indexes.map(function(i){return '<tr><td>'+esc(i.name)+'</td>' +
         '<td class="mono">'+esc(JSON.stringify(i.key))+'</td>' +
         '<td>'+(i.unique?'<span class="pill green">YES</span>':'—')+'</td>' +
         '<td>'+(i.expireAfterSeconds||'—')+'</td>' +
         '<td>'+(i.name==='_id_'?'':'<button class="btn danger sm" onclick="dropIx(\''+esc(i.name)+'\')">🗑</button>')+'</td></tr>';}).join('')) +
-      '</tbody></table></div>';}
+      '</tbody></table></div>');}
   catch(e){showAlert(e.message,'error');}}
 async function loadIxStats(){const db=document.getElementById('ixDb').value;const col=document.getElementById('ixCol').value;
   try{const j=await api('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/index/stats');
-    document.getElementById('ixContent').innerHTML='<div class="table-wrap" style="margin-top:12px;">' +
+    setEl('ixContent','<div class="table-wrap" style="margin-top:12px;">' +
       '<table><thead><tr><th>Index</th><th>Accesses</th><th>Since</th></tr></thead><tbody>' +
       (j.stats.map(function(s){return '<tr><td>'+esc(s.name)+'</td>' +
         '<td>'+(((s.accesses||{}).ops)||0)+'</td>' +
         '<td class="muted">'+esc((((s.accesses||{}).since)||'').slice(0,19))+'</td></tr>';}).join('')) +
-      '</tbody></table></div>';}
+      '</tbody></table></div>');}
   catch(e){showAlert(e.message,'error');}}
 function showCreateIndex(){const keys=prompt('Keys:','{"field":1}');if(!keys)return;
   const opts=prompt('Options:','{}')||'{}';
@@ -5835,8 +5945,8 @@ function render_text(){
 async function runText(){const db=document.getElementById('txtDb').value;const col=document.getElementById('txtCol').value;
   const query=document.getElementById('txtQuery').value.trim();if(!query)return;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/text',{query:query});
-    document.getElementById('txtOut').textContent=JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('txtOut').textContent='Error: '+e.message;}}
+    setTxt('txtOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('txtOut','Error: '+e.message);}}
 function render_distinct(){
   setContent('<div class="card"><div class="card-title"><span class="ico">🎯</span>Distinct Values</div>' +
     '<div class="row"><select class="select grow" id="dDb"></select>' +
@@ -5850,8 +5960,8 @@ function render_distinct(){
 async function runDistinct(){const db=document.getElementById('dDb').value;const col=document.getElementById('dCol').value;
   const key=document.getElementById('dKey').value.trim();const filter=document.getElementById('dFilter').value||'{}';
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/distinct',{key:key,filter:filter});
-    document.getElementById('dOut').textContent=JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('dOut').textContent='Error: '+e.message;}}
+    setTxt('dOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('dOut','Error: '+e.message);}}
 
 function render_fam(){
   setContent('<div class="card"><div class="card-title"><span class="ico">✏️</span>findAndModify</div>' +
@@ -5873,8 +5983,8 @@ async function runFam(){const db=document.getElementById('famDb').value;const co
   const remove=document.getElementById('famRemove').checked;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/findandmodify',
       {query:query,update:update,new:isNew,upsert:upsert,remove:remove});
-    document.getElementById('famOut').textContent=JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('famOut').textContent='Error: '+e.message;}}
+    setTxt('famOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('famOut','Error: '+e.message);}}
 function render_bulk(){
   setContent('<div class="card"><div class="card-title"><span class="ico">⚙️</span>Bulk Write</div>' +
     '<div class="row"><select class="select grow" id="bulkDb"></select>' +
@@ -5888,8 +5998,8 @@ function render_bulk(){
 async function runBulk(){const db=document.getElementById('bulkDb').value;const col=document.getElementById('bulkCol').value;
   const ops=document.getElementById('bulkOps').value;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/bulk',{operations:ops});
-    document.getElementById('bulkOut').textContent=JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('bulkOut').textContent='Error: '+e.message;}}
+    setTxt('bulkOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('bulkOut','Error: '+e.message);}}
 
 function render_mask(){
   setContent('<div class="card"><div class="card-title"><span class="ico">🎭</span>Anonymize PII</div>' +
@@ -5931,8 +6041,8 @@ async function doExport(fmt){
   if(!db||!col)return;
   if(fmt==='zip'){dlCol(db,col,'zip');return;}
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/export',{format:fmt});
-    const out=document.getElementById('ioOut');
-    out.textContent = fmt==='csv' ? j.csv : (fmt==='jsonl' ? j.jsonl : JSON.stringify(j.json,null,2));}
+    const txt = fmt==='csv' ? j.csv : (fmt==='jsonl' ? j.jsonl : JSON.stringify(j.json,null,2));
+    setTxt('ioOut', txt || '');}
   catch(e){showAlert(e.message,'error');}}
 async function doImport(){const db=document.getElementById('ioDb').value;const col=document.getElementById('ioCol').value;
   const j=document.getElementById('importJson').value;if(!db||!col||!j)return;
@@ -5946,10 +6056,10 @@ function render_backup(){
     '<button class="btn primary" onclick="doBackup()">Run</button></div>' +
     '<div class="code" id="backupOut" style="margin-top:12px;max-height:400px;"></div></div>');
 }
-async function doBackup(){const db=document.getElementById('backupDb').value;const out=document.getElementById('backupOut');
-  out.textContent='Running...';
-  try{const j=await apiBody('/api/user/backup',{db:db});out.textContent=JSON.stringify(j,null,2);}
-  catch(e){out.textContent='Error: '+e.message;}}
+async function doBackup(){const db=document.getElementById('backupDb').value;
+  setTxt('backupOut','Running...');
+  try{const j=await apiBody('/api/user/backup',{db:db});setTxt('backupOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('backupOut','Error: '+e.message);}}
 
 function render_danger(){
   setContent('<div class="card"><div class="card-title"><span class="ico" style="color:#FF3B5C;">⚠️</span>Destructive</div>' +
@@ -5981,8 +6091,8 @@ async function dropIxs(){const db=document.getElementById('dangerDb').value;cons
   catch(e){showAlert(e.message,'error');}}
 async function runRaw(){const cmd=document.getElementById('rawCmd').value;const db=document.getElementById('rawDb').value||'admin';
   try{const j=await apiBody('/api/user/raw',{command:cmd,db:db});
-    document.getElementById('dangerOut').textContent=JSON.stringify(j.result,null,2);}
-  catch(e){document.getElementById('dangerOut').textContent='Error: '+e.message;}}
+    setTxt('dangerOut',JSON.stringify(j.result,null,2));}
+  catch(e){setTxt('dangerOut','Error: '+e.message);}}
 function render_advanced_cmd(){
   setContent('<div class="card"><div class="card-title"><span class="ico">💥</span>Advanced Commands</div>' +
     '<div class="row"><select class="select grow" id="advDb"></select>' +
@@ -5995,17 +6105,17 @@ function render_advanced_cmd(){
 }
 async function advValidate(){const db=document.getElementById('advDb').value;const col=document.getElementById('advCol').value;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/validate',{full:true});
-    document.getElementById('advOut').textContent=JSON.stringify(j.result,null,2);}
-  catch(e){document.getElementById('advOut').textContent='Error: '+e.message;}}
+    setTxt('advOut',JSON.stringify(j.result,null,2));}
+  catch(e){setTxt('advOut','Error: '+e.message);}}
 async function advReindex(){const db=document.getElementById('advDb').value;const col=document.getElementById('advCol').value;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/reindex',{});
-    document.getElementById('advOut').textContent=JSON.stringify(j.result,null,2);}
-  catch(e){document.getElementById('advOut').textContent='Error: '+e.message;}}
+    setTxt('advOut',JSON.stringify(j.result,null,2));}
+  catch(e){setTxt('advOut','Error: '+e.message);}}
 async function advCompact(){const db=document.getElementById('advDb').value;const col=document.getElementById('advCol').value;
   if(!confirm('Compact?'))return;
   try{const j=await apiBody('/api/user/db/'+encodeURIComponent(db)+'/col/'+encodeURIComponent(col)+'/compact',{});
-    document.getElementById('advOut').textContent=JSON.stringify(j.result,null,2);}
-  catch(e){document.getElementById('advOut').textContent='Error: '+e.message;}}
+    setTxt('advOut',JSON.stringify(j.result,null,2));}
+  catch(e){setTxt('advOut','Error: '+e.message);}}
 
 function render_utils(){
   setContent('<div class="card" style="border-color:rgba(255,34,85,.4);">' +
@@ -6080,7 +6190,7 @@ async function lookupPincode(){
   const code = document.getElementById('pinInput').value.trim();
   if(!/^\d{6}$/.test(code)){showAlert('PIN code must be 6 digits','error');return;}
   try{ const j = await api('/api/util/pincode?code=' + encodeURIComponent(code));
-    document.getElementById('pinOut').textContent = JSON.stringify(j, null, 2);
+    setTxt('pinOut', JSON.stringify(j, null, 2));
   }catch(e){showAlert('PIN: ' + e.message, 'error');}
 }
 function showIpModal(ipLabel, j){
@@ -6105,14 +6215,14 @@ function render_master(){
 }
 async function loadMasterStats(){
   try{const j=await api('/api/master/dashboard');
-    document.getElementById('masterStats').innerHTML =
+    setEl('masterStats',
       '<div class="stat"><span class="num">'+j.total_users+'</span><span class="lbl">Users</span></div>' +
       '<div class="stat blue"><span class="num">'+j.total_devices+'</span><span class="lbl">Devices</span></div>' +
       '<div class="stat amber"><span class="num">'+j.total_visits+'</span><span class="lbl">Visits</span></div>' +
       '<div class="stat purple"><span class="num">'+j.total_audits+'</span><span class="lbl">Audits</span></div>' +
       '<div class="stat red"><span class="num">'+j.total_login_attempts+'</span><span class="lbl">Logins</span></div>' +
       '<div class="stat"><span class="num">'+j.active_sessions+'</span><span class="lbl">Sessions</span></div>' +
-      '<div class="stat purple"><span class="num">'+(j.total_master_uris||0)+'</span><span class="lbl">Vault</span></div>';
+      '<div class="stat purple"><span class="num">'+(j.total_master_uris||0)+'</span><span class="lbl">Vault</span></div>');
   }catch(e){showAlert(e.message,'error');}
 }
 function render_visitors(){
@@ -6238,13 +6348,13 @@ function render_logins(){
 }
 async function loadLogins(){
   try{const j=await api('/api/master/login-attempts');
-    document.getElementById('loginRows').innerHTML=((j.attempts||[]).map(function(a){
+    setEl('loginRows',((j.attempts||[]).map(function(a){
       return '<tr><td>'+esc(a.identifier||'')+'</td>' +
       '<td><span class="badge '+(a.role||'user')+'">'+esc(a.role||'')+'</span></td>' +
       '<td><span class="badge '+(a.success?'ok':'bad')+'">'+(a.success?'✓':'✗')+'</span></td>' +
       '<td class="mono">'+esc(a.ip)+'</td>' +
       '<td class="muted">'+esc((a.timestamp||'').slice(0,19).replace('T',' '))+'</td>' +
-      '<td>'+ipBtn(a.ip)+'</td></tr>';}).join('') || '<tr><td colspan="6">'+empty('🔐','None')+'</td></tr>');}
+      '<td>'+ipBtn(a.ip)+'</td></tr>';}).join('') || '<tr><td colspan="6">'+empty('🔐','None')+'</td></tr>'));}
   catch(e){showAlert(e.message,'error');}
 }
 function render_audits(){
@@ -6255,12 +6365,12 @@ function render_audits(){
 }
 async function loadAudits(){
   try{const j=await api('/api/master/audits');
-    document.getElementById('auditRows').innerHTML=((j.audits||[]).map(function(a){
+    setEl('auditRows',((j.audits||[]).map(function(a){
       return '<tr><td><span class="pill">'+esc(a.action)+'</span></td>' +
       '<td>'+esc(a.user)+'</td><td class="mono">'+esc(a.ip)+'</td>' +
       '<td class="muted">'+esc((a.timestamp||'').slice(0,19).replace('T',' '))+'</td>' +
       '<td class="mono muted">'+esc(JSON.stringify(a.details||{}).slice(0,60))+'</td>' +
-      '<td>'+ipBtn(a.ip)+'</td></tr>';}).join('') || '<tr><td colspan="6">'+empty('📜','None')+'</td></tr>');}
+      '<td>'+ipBtn(a.ip)+'</td></tr>';}).join('') || '<tr><td colspan="6">'+empty('📜','None')+'</td></tr>'));}
   catch(e){showAlert(e.message,'error');}
 }
 function render_storage(){
@@ -6273,13 +6383,13 @@ function render_storage(){
 }
 async function loadStorage(){
   try{const j=await api('/api/master/storage');
-    document.getElementById('storageRows').innerHTML=Object.keys(j.storage||{}).map(function(db){
+    setEl('storageRows',Object.keys(j.storage||{}).map(function(db){
       const s = j.storage[db];const dbE=esc(db);
       return '<tr><td><strong>'+dbE+'</strong></td>' +
       '<td>'+(s.collections||0)+'</td><td>'+(s.documents||0)+'</td>' +
       '<td>'+fmt(s.size||0)+'</td><td>'+fmt(s.storage||0)+'</td>' +
       '<td><button class="btn green sm" onclick="dlMasterDb(\''+dbE+'\')">⬇ ZIP</button></td></tr>';}).join('')
-      || '<tr><td colspan="6">'+empty('💾','Empty')+'</td></tr>';}
+      || '<tr><td colspan="6">'+empty('💾','Empty')+'</td></tr>');}
   catch(e){showAlert(e.message,'error');}
 }
 function render_impersonate(){
@@ -6293,8 +6403,8 @@ function render_impersonate(){
 async function doImpersonate(){const vid=document.getElementById('impVid').value.trim();if(!vid)return;await impersonate(vid);}
 async function doConnectOnly(){const vid=document.getElementById('impVid').value.trim();if(!vid)return;
   try{const j=await api('/api/gm/connect/'+encodeURIComponent(vid));
-    document.getElementById('impOut').textContent=JSON.stringify(j,null,2);}
-  catch(e){document.getElementById('impOut').textContent='Error: '+e.message;}}
+    setTxt('impOut',JSON.stringify(j,null,2));}
+  catch(e){setTxt('impOut','Error: '+e.message);}}
 function render_wipe(){
   setContent('<div class="card"><div class="card-title"><span class="ico" style="color:#FF3B5C;">💀</span>Wipe Collection</div>' +
     '<div class="hint danger">Deletes ALL docs. Irreversible.</div>' +
@@ -6312,7 +6422,7 @@ async function doWipe(){
   const col=document.getElementById('wipeCol').value;const conf=document.getElementById('wipeConfirm').value.trim();
   if(conf!==col){showAlert('Mismatch','error');return;}
   try{const j=await apiBody('/api/gm/wipe/'+col,{confirm:conf});
-    document.getElementById('wipeOut').textContent='Wiped '+j.deleted+' from '+col;
+    setTxt('wipeOut','Wiped '+j.deleted+' from '+col);
     showAlert('Wiped','success');}
   catch(e){showAlert(e.message,'error');}
 }
@@ -6372,11 +6482,11 @@ def page_dashboard():
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     logger.info("═" * 60)
-    logger.info("🥭 TOCXIC v77 — /superadmin ONLY · downloads · format · auto-fit")
+    logger.info("🥭 TOCXIC v78 — DB sessions · /superadmin · no timeout")
     logger.info(f"✓ /            → landing")
     logger.info(f"✓ /connect     → user URI connect")
     logger.info(f"✓ /superadmin  → admin login (only entry)")
-    logger.info(f"✓ /superadmin/owner-panel  → owner console (session-bridged)")
+    logger.info(f"✓ /superadmin/owner-panel  → owner console")
     logger.info(f"✓ /dashboard   → main dashboard")
     logger.info(f"✓ Port: {port}")
     logger.info("═" * 60)
